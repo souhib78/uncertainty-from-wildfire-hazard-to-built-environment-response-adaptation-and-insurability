@@ -1,5 +1,5 @@
 """UNBURNT prototype (Streamlit version): wildfire hazard -> loss, with uncertainty propagation.
-Hazard link: bootstrap ensemble + isotonic calibration + split conformal.
+Hazard link: bootstrap ensemble + Platt (sigmoid) calibration + split conformal.
 Links 2-4 (response, adaptation, insurability): ILLUSTRATIVE parameters only.
 Data: put your real data in data.csv (columns: temperature, wind, humidity, drought, fire)
 otherwise a SYNTHETIC dataset is generated.
@@ -12,7 +12,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 
 FEATURES = ["temperature", "wind", "humidity", "drought"]
@@ -54,21 +54,50 @@ def train():
     def raw(Xq):
         return np.array([m.predict_proba(Xq)[:, 1] for m in members])  # (B, n)
 
-    iso = IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1)
-    iso.fit(raw(Xcal).mean(0), ycal)
+    def logit(p):
+        p = np.clip(p, 1e-3, 1 - 1e-3)
+        return np.log(p / (1 - p)).reshape(-1, 1)
+
+    def fit_platt(p_raw, y):
+        return LogisticRegression(C=1.0).fit(logit(p_raw), y)
+
+    def conf_q(p, y):
+        sc = 1 - np.where(y == 1, p, 1 - p)
+        n = len(sc)
+        return np.quantile(sc, min(1, np.ceil((n + 1) * (1 - ALPHA)) / n))
+
+    # pool = calibration + test (never used to train the forests)
+    Xpool = np.vstack([Xcal, Xte])
+    ypool = np.concatenate([ycal, yte])
+    pm_raw = raw(Xpool).mean(0)
+
+    # deployed calibrator (Platt / sigmoid) and conformal threshold, fitted on the whole pool
+    plat_all = fit_platt(pm_raw, ypool)
 
     def member_probs(Xq):
-        return np.clip(iso.predict(raw(Xq).ravel()).reshape(B, -1), 0, 1)
+        r = raw(Xq)
+        return plat_all.predict_proba(logit(r.ravel()))[:, 1].reshape(B, -1)
 
-    # conformal (LAC score) on calibration set
-    pc = member_probs(Xcal).mean(0)
-    s = 1 - np.where(ycal == 1, pc, 1 - pc)
-    n = len(s)
-    q = np.quantile(s, min(1, np.ceil((n + 1) * (1 - ALPHA)) / n))
+    q = conf_q(plat_all.predict_proba(logit(pm_raw))[:, 1], ypool)
 
-    # held-out evaluation
-    pt = member_probs(Xte).mean(0)
-    cover = np.mean((1 - np.where(yte == 1, pt, 1 - pt)) <= q)
+    # conformal coverage over 200 random 50/50 splits of the pool (mean, sd)
+    rs = np.random.default_rng(7)
+    covs = []
+    for _ in range(200):
+        idx = rs.permutation(len(ypool))
+        h = len(idx) // 2
+        ia, ib = idx[:h], idx[h:]
+        pl = fit_platt(pm_raw[ia], ypool[ia])
+        pa = pl.predict_proba(logit(pm_raw[ia]))[:, 1]
+        pb = pl.predict_proba(logit(pm_raw[ib]))[:, 1]
+        qq = conf_q(pa, ypool[ia])
+        covs.append(np.mean(1 - np.where(ypool[ib] == 1, pb, 1 - pb) <= qq))
+    cover = (float(np.mean(covs)), float(np.std(covs)))
+
+    # calibration curve / Brier on one fixed split
+    plat_c = fit_platt(raw(Xcal).mean(0), ycal)
+    pt = plat_c.predict_proba(logit(raw(Xte).mean(0)))[:, 1]
+    brier = float(np.mean((pt - yte) ** 2))
     bins = np.linspace(0, 1, 11)
     ids = np.clip(np.digitize(pt, bins) - 1, 0, 9)
     bx = [pt[ids == i].mean() for i in range(10) if (ids == i).sum() >= 10]
@@ -124,8 +153,9 @@ def run_hazard(t, w, h, d):
     txt = (f"### Fire probability: **{pm:.0%}**  (90% ensemble interval {lo:.0%} – {hi:.0%})\n\n"
            f"- Conformal prediction set (≥{1-ALPHA:.0%} coverage): **{cs_txt}**\n"
            f"- Aleatoric (data noise) ≈ {alea:.3f} | Epistemic (model disagreement) ≈ {epi:.4f}\n\n"
-           f"Held-out check: conformal coverage = {COVER:.1%} (target {1-ALPHA:.0%}), "
-           f"Brier = {BRIER:.3f}.\n\n{DATA_NOTE}")
+           f"Check over 200 random splits: conformal coverage = {COVER[0]:.1%} ± {COVER[1]:.1%} "
+           f"(target {1-ALPHA:.0%}); Brier = {BRIER:.3f}. "
+           f"Small sample: treat these figures as indicative.\n\n{DATA_NOTE}")
     return txt, fig
 
 
@@ -188,6 +218,7 @@ def run_budget(t, w, h, d, btype, dist, adapt, value):
 
 LIMITS = """
 ### Limitations
+- Very small dataset (244 daily records, one summer): calibration and coverage are unstable.
 - Hazard model trained on tabular weather variables only; no fuel, topography or ignition sources.
 - Conformal guarantees assume exchangeability (no temporal/spatial shift handled yet).
 - Links 2–4 use **placeholder** parameters; the one-at-a-time budget ignores interactions.
